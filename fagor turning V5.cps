@@ -45,7 +45,7 @@ extension = "pit";
 programNameIsInteger = true;
 setCodePage("ascii");
 
-capabilities = CAPABILITY_TURNING;
+capabilities = CAPABILITY_MILLING | CAPABILITY_TURNING;
 tolerance = spatial(0.002, MM);
 
 minimumChordLength = spatial(0.25, MM);
@@ -114,7 +114,7 @@ properties = {
       {title:"Both Z then X", id:"ZX"},
       {title:"Both same line", id:"singleLineXZ"}
     ],
-    value: "XZ",
+    value: "ZX",
     scope: "post"
   },
   approachStyle: {
@@ -123,10 +123,11 @@ properties = {
     type       : "enum",
     group      : "preferences",
     values     : [
+      {title:"First X then Z", id:"XZ"},
       {title:"First Z then X", id:"ZX"},
       {title:"Both XZ in same line", id:"singleLineXZ"}
     ],
-    value: "singleLineXZ",
+    value: "XZ",
     scope: "post"
   },
   showSequenceNumbers: {
@@ -196,7 +197,7 @@ properties = {
     description: "G53 X-axis home position.",
     group      : "homePositions",
     type       : "number",
-    value      : 5,
+    value      : 0,
     scope      : "post"
   },
   homePositionZ: {
@@ -204,7 +205,7 @@ properties = {
     description: "G53 Z-axis home position.",
     group      : "homePositions",
     type       : "number",
-    value      : 20,
+    value      : 5.5,
     scope      : "post"
   },
   useCycles: {
@@ -218,6 +219,14 @@ properties = {
   useParametricFeed: {
     title      : "Parametric feed",
     description: "Specifies the feed value that should be output using a Q value.",
+    group      : "preferences",
+    type       : "boolean",
+    value      : false,
+    scope      : "post"
+  },
+  millingLookAhead: {
+    title      : "Milling look-ahead (G51)",
+    description: "Enable G51 at start of milling sections to improve smoothing on dense toolpaths.",
     group      : "preferences",
     type       : "boolean",
     value      : false,
@@ -350,11 +359,14 @@ var oFormat = createFormat({prefix:"O", decimals:0, width:6, zeropad:true});
 
 var spatialFormat = createFormat({decimals:(unit == MM ? 3 : 4), forceDecimal:true});
 var xFormat = createFormat({decimals:(unit == MM ? 3 : 4), forceDecimal:true, scale:2}); // diameter mode
+var xHomeFormat = createFormat({decimals:(unit == MM ? 3 : 4), forceDecimal:true});
 var yFormat = createFormat({decimals:(unit == MM ? 3 : 4), forceDecimal:true});
 var zFormat = createFormat({decimals:(unit == MM ? 3 : 4), forceDecimal:true});
 var rFormat = createFormat({decimals:(unit == MM ? 3 : 4), forceDecimal:true}); // radius
+var cFormat = createFormat({decimals:3, forceDecimal:true, scale:DEG, cyclicLimit:Math.PI * 2});
 var feedFormat = createFormat({decimals:(unit == MM ? 4 : 5), forceDecimal:true});
 var iFormat = createFormat({decimals:(unit == MM ? 3 : 4), forceDecimal:true, scale:1});
+var taperFormat = createFormat({decimals:1, scale:DEG});
 var pitchFormat = createFormat({decimals:5, forceDecimal:true});
 var toolFormat = createFormat({decimals:0});
 var rpmFormat = createFormat({decimals:0});
@@ -362,6 +374,7 @@ var kFormat = createFormat({decimals:0}); // centiseconds // range 1-9999
 
 var xOutput; // xOutput is defined in setDirectionX()
 var yOutput = createVariable({prefix:"Y"}, yFormat);
+var cOutput = createVariable({prefix:"C"}, cFormat);
 var zOutput = createVariable({onchange:function() {retracted[Z] = false;}, prefix:"Z"}, zFormat);
 var feedOutput = createVariable({prefix:"F"}, feedFormat);
 var pitchOutput = createVariable({prefix:"L", force:true}, pitchFormat);
@@ -370,6 +383,7 @@ var sOutput = createVariable({prefix:"S", force:true}, rpmFormat);
 // circular output
 var kOutput = createReferenceVariable({prefix:"K", force:true}, spatialFormat);
 var iOutput; // iOutput is defined in setDirectionX()
+var jOutput = createReferenceVariable({prefix:"J", force:true}, spatialFormat);
 
 var gMotionModal = createModal({}, gFormat); // modal group 1 // G0-G3, ...
 var gPlaneModal = createModal({onchange:function () {gMotionModal.reset();}}, gFormat); // modal group 2 // G17-19
@@ -382,8 +396,10 @@ var gCycleModal = createModal({force:true}, gFormat); // modal group 9 // G81, .
 
 // fixed settings
 var firstFeedParameter = 500;
-var gotSecondarySpindle = true;
+var gotSecondarySpindle = false;
 var gotTailStock = false;
+var gotLiveTooling = true;
+var gotCAxis = true;
 
 var XAXIS = 0;
 var ZAXIS = 1;
@@ -404,6 +420,8 @@ var currentWorkOffset;
 var optionalSection = false;
 var forceSpindleSpeed = false;
 var tapping = false;
+var useXZCMode = false;
+var usePolarMode = false;
 var activeMovements; // do not use by default
 var currentFeedId;
 var previousSpindle = SPINDLE_PRIMARY;
@@ -566,7 +584,7 @@ function writeBlock() {
   }
   // Map of code meanings
   var codeMeanings = {
-    G0: "Rapid traverse (6.1)", G1: "Linear interpolation (6.2)", G2: "Clockwise circular interpolation (6.3)", G3: "Counterclockwise circular interpolation (6.3)", G4: "Dwell/interruption (7.1/7.2)", G5: "Round corner (7.3.2)", G6: "Circle center absolute (6.4)", G7: "Square corner (7.3.1)", G8: "Arc tangent to previous (6.5)", G9: "Arc defined by three points (6.6)", G10: "Mirror image cancel (7.5)", G11: "Mirror X axis (7.5)", G12: "Mirror Y axis (7.5)", G13: "Mirror Z axis (7.5)", G14: "Mirror programmed directions (7.5)", G16: "Main plane by two addresses (3.2)", G17: "Main plane X-Y/Z (3.2)", G18: "Main plane Z-X/Y (3.2)", G19: "Main plane Y-Z/X (3.2)", G20: "Lower work zone limits (3.8.1)", G21: "Upper work zone limits (3.8.1)", G22: "Enable/disable work zones (3.8.2)", G32: "Feedrate F as inverted time (6.15)", G33: "Electronic threading (6.11)", G34: "Variable-pitch threading (6.13)", G36: "Controlled corner rounding (6.9)", G37: "Tangential entry (6.7)", G38: "Tangential exit (6.8)", G39: "Chamfer (6.10)", G40: "Cancel tool radius comp (8.2.6)", G41: "Left tool radius comp (8.2.3)", G42: "Right tool radius comp (8.2.3)", G50: "Controlled corner rounding (7.3.3)", G51: "Look-Ahead (7.4)", G52: "Movement until contact (6.14)", G53: "Machine zero (4.3)", G54: "Absolute zero offset 1 (4.4.2)", G55: "Absolute zero offset 2 (4.4.2)", G56: "Absolute zero offset 3 (4.4.2)", G57: "Absolute zero offset 4 (4.4.2)", G58: "Additive zero offset 1 (4.4.2)", G59: "Additive zero offset 2 (4.4.2)", G66: "Pattern repeat cycle (9.1)", G68: "X axis roughing cycle (9.2)", G69: "Z axis roughing cycle (9.3)", G70: "Programming in inches (3.3)", G71: "Programming in mm (3.3)", G72: "Scaling factor (7.6)", G74: "Home search (4.2)", G75: "Probing move until touching (10.1)", G76: "Probing move while touching (10.1)", G81: "Turning cycle straight (9.4)", G82: "Facing cycle straight (9.5)", G83: "Drilling cycle (9.6)", G84: "Turning cycle curved (9.7)", G85: "Facing cycle curved (9.8)", G86: "Longitudinal threading cycle (9.9)", G87: "Face threading cycle (9.10)", G88: "X axis grooving cycle (9.11)", G89: "Z axis grooving cycle (9.12)", G90: "Absolute programming (3.4)", G91: "Incremental programming (3.4)", G92: "Coordinate preset/spindle speed limit (4.4.1)", G93: "Polar origin preset (4.5)", G94: "Feedrate per minute (5.2.1)", G95: "Feedrate per revolution (5.2.2)", G96: "Constant surface speed (5.3.1)", G97: "Spindle speed in RPM (5.3.2)", G151: "Programming X axis diameter (3.5)", G152: "Programming X axis radius (3.5)", G159: "Absolute zero offsets (4.4.2)", G233: "Withdrawal axes threading (6.12)", M3: "Spindle ON (standard)", M8: "Coolant ON (standard)", M9: "Coolant OFF (standard)", M10: "Clamp sub chuck (custom)", M11: "Unclamp main chuck (custom)", M30: "Program end (standard)"
+    G0: "Rapid traverse (6.1)", G1: "Linear interpolation (6.2)", G2: "Clockwise circular interpolation (6.3)", G3: "Counterclockwise circular interpolation (6.3)", G4: "Dwell/interruption (7.1/7.2)", G5: "Round corner (7.3.2)", G6: "Circle center absolute (6.4)", G7: "Square corner (7.3.1)", G8: "Arc tangent to previous (6.5)", G9: "Arc defined by three points (6.6)", G10: "Mirror image cancel (7.5)", G11: "Mirror X axis (7.5)", G12: "Mirror Y axis (7.5)", G13: "Mirror Z axis (7.5)", G14: "Mirror programmed directions (7.5)", G15: "Polar interpolation ON (4.5)", G16: "Polar interpolation axes selection (XC) (4.5)", G17: "Main plane X-Y/Z (3.2)", G18: "Main plane Z-X/Y (3.2)", G19: "Main plane Y-Z/X (3.2)", G20: "Lower work zone limits (3.8.1)", G21: "Upper work zone limits (3.8.1)", G22: "Enable/disable work zones (3.8.2)", G32: "Feedrate F as inverted time (6.15)", G33: "Electronic threading (6.11)", G34: "Variable-pitch threading (6.13)", G36: "Controlled corner rounding (6.9)", G37: "Tangential entry (6.7)", G38: "Tangential exit (6.8)", G39: "Chamfer (6.10)", G40: "Cancel tool radius comp (8.2.6)", G41: "Left tool radius comp (8.2.3)", G42: "Right tool radius comp (8.2.3)", G50: "Controlled corner rounding (7.3.3)", G51: "Look-Ahead (7.4)", G52: "Movement until contact (6.14)", G53: "Machine zero (4.3)", G54: "Absolute zero offset 1 (4.4.2)", G55: "Absolute zero offset 2 (4.4.2)", G56: "Absolute zero offset 3 (4.4.2)", G57: "Absolute zero offset 4 (4.4.2)", G58: "Additive zero offset 1 (4.4.2)", G59: "Additive zero offset 2 (4.4.2)", G66: "Pattern repeat cycle (9.1)", G68: "X axis roughing cycle (9.2)", G69: "Z axis roughing cycle (9.3)", G70: "Programming in inches (3.3)", G71: "Programming in mm (3.3)", G72: "Scaling factor (7.6)", G74: "Home search (4.2)", G75: "Probing move until touching (10.1)", G76: "Probing move while touching (10.1)", G81: "Turning cycle straight (9.4)", G82: "Facing cycle straight (9.5)", G83: "Drilling cycle (9.6)", G84: "Turning cycle curved (9.7)", G85: "Facing cycle curved (9.8)", G86: "Longitudinal threading cycle (9.9)", G87: "Face threading cycle (9.10)", G88: "X axis grooving cycle (9.11)", G89: "Z axis grooving cycle (9.12)", G90: "Absolute programming (3.4)", G91: "Incremental programming (3.4)", G92: "Coordinate preset/spindle speed limit (4.4.1)", G93: "Polar origin preset (4.5)", G94: "Feedrate per minute (5.2.1)", G95: "Feedrate per revolution (5.2.2)", G96: "Constant surface speed (5.3.1)", G97: "Spindle speed in RPM (5.3.2)", G151: "Programming X axis diameter (3.5)", G152: "Programming X axis radius (3.5)", G159: "Absolute zero offsets (4.4.2)", G233: "Withdrawal axes threading (6.12)", M3: "Spindle ON (standard)", M8: "Coolant ON (standard)", M9: "Coolant OFF (standard)", M10: "Clamp sub chuck (custom)", M11: "Unclamp main chuck (custom)", M30: "Program end (standard)"
   };
   var comment = "";
   if (getProperty("annotateGMCodes")) {
@@ -668,7 +686,7 @@ function onOpen() {
       error(localize("Program number is out of range."));
       return;
     }
-    writeln(oFormat.format(programId));
+    writeln(";" + oFormat.format(programId));
   } else {
     error(localize("Program name has not been specified."));
     return;
@@ -984,6 +1002,81 @@ function getSpindle() {
   }
 }
 
+function getLiveToolingMode(section) {
+  if (section.getType() != TYPE_MILLING) {
+    return -1;
+  }
+  // 0=axial (+Z), 1=axial (-Z), 2=radial (XZC).
+  var forward = section.workPlane.forward;
+  if (isSameDirection(forward, new Vector(0, 0, 1))) {
+    return 0; // axial / G17
+  } else if (isSameDirection(forward, new Vector(0, 0, -1))) {
+    return 1;
+  } else if (Vector.dot(forward, new Vector(0, 0, 1)) < 1e-7) {
+    return 2; // radial / XZC
+  }
+  error(localize("Orientation is not supported by CNC machine."));
+  return -1;
+}
+
+function getModulus(x, y) {
+  return Math.sqrt(x * x + y * y);
+}
+
+function getC(x, y) {
+  return Math.atan2(y, x);
+}
+
+// Keep C output continuous by selecting the nearest valid angle to current C.
+function getCClosest(x, y, _c, clockwise) {
+  if (_c == Number.POSITIVE_INFINITY) {
+    _c = 0;
+  }
+  var c = getC(x, y);
+  if (clockwise != undefined) {
+    if (clockwise) {
+      while (c < _c) {
+        c += Math.PI * 2;
+      }
+    } else {
+      while (c > _c) {
+        c -= Math.PI * 2;
+      }
+    }
+  } else {
+    var min = _c - Math.PI;
+    var max = _c + Math.PI;
+    while (c < min) {
+      c += Math.PI * 2;
+    }
+    while (c > max) {
+      c -= Math.PI * 2;
+    }
+  }
+  return c;
+}
+
+// Estimate segmentation needed to stay inside the requested chordal tolerance.
+function getNumberOfSegments(radius, sweep, error) {
+  if (radius > error) {
+    var stepAngle = 2 * Math.acos(1 - error / radius);
+    return Math.max(Math.ceil(sweep / stepAngle), 1);
+  }
+  return 1;
+}
+
+function getTolerance() {
+  var t = tolerance;
+  if (hasParameter("operation:tolerance")) {
+    if (t > 0) {
+      t = Math.min(t, getParameter("operation:tolerance"));
+    } else {
+      t = getParameter("operation:tolerance");
+    }
+  }
+  return t;
+}
+
 function handleSubSpindleOperation() {
   // Output M-codes and pauses for spindle grab and bar-pull
   if (isSubSpindleGrab || isSubSpindleBarPull) {
@@ -1295,6 +1388,25 @@ function setDirectionX() {
   iOutput = createReferenceVariable({prefix:"I"}, iFormat);
 }
 
+function setPolarMode(activate) {
+  if (activate) {
+    var xScale = (toolingData.toolPost == FRONT) ? -1 : 1;
+    xFormat.setScale(xScale);
+    iFormat.setScale(xScale);
+    xOutput = createVariable({onchange:function() {retracted[X] = false;}, prefix:"X"}, xFormat);
+    iOutput = createReferenceVariable({prefix:"I"}, iFormat);
+    writeBlock(gFormat.format(15));
+    writeBlock(gFormat.format(16) + " XC");
+    yOutput = createVariable({prefix:"C"}, yFormat);
+    yOutput.enable();
+  } else {
+    setDirectionX();
+    yOutput = createVariable({prefix:"Y"}, yFormat);
+    yOutput.disable();
+  }
+  forceXYZ();
+}
+
 function onSection() {
   threadingCycleDone = false;
   suppressThreadCyclePointMotion = false;
@@ -1302,21 +1414,43 @@ function onSection() {
   isSubSpindleBarPull = false;
   subSpindleOperationActive = false;
 
-  if (currentSection.getType() != TYPE_TURNING) {
-    if (!hasParameter("operation-strategy") || (getParameter("operation-strategy") != "drill")) {
-      if (currentSection.getType() == TYPE_MILLING) {
-        error(localize("Milling toolpath is not supported."));
-      } else {
-        error(localize("Non-turning toolpath is not supported."));
-      }
-      return;
-    }
+  if ((currentSection.getType() != TYPE_TURNING) && (currentSection.getType() != TYPE_MILLING)) {
+    error(localize("Non-turning toolpath is not supported."));
+    return;
   }
 
   var forceSectionRestart = optionalSection && !currentSection.isOptional();
   optionalSection = currentSection.isOptional();
 
   var turning = (currentSection.getType() == TYPE_TURNING);
+  useXZCMode = false;
+  var desiredPolarMode = false;
+  if (currentSection.getType() == TYPE_MILLING) {
+    if (!gotLiveTooling) {
+      error(localize("Live tooling is not supported by the CNC machine."));
+      return;
+    }
+    if (!gotCAxis) {
+      error(localize("C-axis is not supported by the CNC machine."));
+      return;
+    }
+    var liveToolingMode = getLiveToolingMode(currentSection);
+    if (liveToolingMode == 1) {
+      error(localize("Milling from Z- is not supported by the CNC machine."));
+      return;
+    }
+    if (liveToolingMode == 0) {
+      // Axial milling: use G15/G16 XC polar interpolation.
+      desiredPolarMode = true;
+      useXZCMode = false;
+    } else {
+      // Radial milling: convert XY motion to X(radius)+C(angle).
+      desiredPolarMode = false;
+      useXZCMode = (liveToolingMode == 2);
+    }
+  }
+
+  usePolarMode = desiredPolarMode;
 
   var insertToolCall = forceSectionRestart || isFirstSection() ||
     currentSection.getForceToolChange && currentSection.getForceToolChange() ||
@@ -1470,6 +1604,15 @@ function onSection() {
 
   // Output modal commands here
   writeBlock(gAbsIncModal.format(90), getCode(currentSection.feedMode == FEED_PER_REVOLUTION ? "FEED_MODE_UNIT_REV" : "FEED_MODE_UNIT_MIN"), gPlaneModal.format(18));
+  if ((currentSection.getType() == TYPE_MILLING) && getProperty("millingLookAhead")) {
+    writeBlock(gFormat.format(51));
+  }
+  if (usePolarMode) {
+    setPolarMode(true);
+  }
+  if (useXZCMode) {
+    writeBlock(gFormat.format(16) + " ZC");
+  }
 
   if (gotTailStock) {
     writeBlock(getCode(currentSection.tailstock ? "TAILSTOCK_ON" : "TAILSTOCK_OFF"));
@@ -1492,7 +1635,26 @@ function onSection() {
   if (insertToolCall || tool.getSpindleMode() == SPINDLE_CONSTANT_SURFACE_SPEED) {
     gMotionModal.reset();
 
-    if (getProperty("approachStyle") == "ZX") {
+    if (useXZCMode) {
+      writeBlock(gAbsIncModal.format(90), gMotionModal.format(0), zOutput.format(initialPosition.z));
+      writeBlock(
+        gAbsIncModal.format(90),
+        gMotionModal.format(0),
+        xOutput.format(getModulus(initialPosition.x, initialPosition.y)),
+        cOutput.format(getCClosest(initialPosition.x, initialPosition.y, cOutput.getCurrent()))
+      );
+    } else if (usePolarMode) {
+      writeBlock(gAbsIncModal.format(90), gMotionModal.format(0), zOutput.format(initialPosition.z));
+      writeBlock(
+        gAbsIncModal.format(90),
+        gMotionModal.format(0),
+        xOutput.format(initialPosition.x),
+        yOutput.format(initialPosition.y)
+      );
+    } else if (getProperty("approachStyle") == "XZ") {
+      writeBlock(gAbsIncModal.format(90), gMotionModal.format(0), xOutput.format(initialPosition.x), yOutput.format(initialPosition.y));
+      writeBlock(gAbsIncModal.format(90), gMotionModal.format(0), zOutput.format(initialPosition.z));
+    } else if (getProperty("approachStyle") == "ZX") {
       writeBlock(gAbsIncModal.format(90), gMotionModal.format(0), zOutput.format(initialPosition.z));
       writeBlock(gAbsIncModal.format(90), gMotionModal.format(0), xOutput.format(initialPosition.x), yOutput.format(initialPosition.y));
     } else {
@@ -1555,24 +1717,59 @@ function onRapid(_x, _y, _z) {
   if (suppressThreadCyclePointMotion) {
     return;
   }
+  if (useXZCMode) {
+    // In XZC mode, remap XY endpoint to cylindrical X/C coordinates.
+    if (pendingRadiusCompensation >= 0) {
+      error(localize("Radius compensation mode is not supported for XZC mode."));
+      return;
+    }
+    var x = xOutput.format(getModulus(_x, _y));
+    var c = cOutput.format(getCClosest(_x, _y, cOutput.getCurrent()));
+    var z = zOutput.format(_z);
+    if (x || c || z) {
+      writeBlock(gMotionModal.format(0), x, c, z);
+    }
+    forceFeed();
+    return;
+  }
   var x = xOutput.format(_x);
   var y = yOutput.format(_y);
   var z = zOutput.format(_z);
+  if (usePolarMode && !x && y) {
+    xOutput.reset();
+    x = xOutput.format(_x);
+  }
   if (x || y || z) {
     if (pendingRadiusCompensation >= 0) {
       pendingRadiusCompensation = -1;
       switch (radiusCompensation) {
       case RADIUS_COMPENSATION_LEFT:
-        writeBlock(gMotionModal.format(0), gFormat.format(41), x, y, z);
+        if (usePolarMode) {
+          writeBlock(gMotionModal.format(0), gFormat.format(41), x, z, y);
+        } else {
+          writeBlock(gMotionModal.format(0), gFormat.format(41), x, y, z);
+        }
         break;
       case RADIUS_COMPENSATION_RIGHT:
-        writeBlock(gMotionModal.format(0), gFormat.format(42), x, y, z);
+        if (usePolarMode) {
+          writeBlock(gMotionModal.format(0), gFormat.format(42), x, z, y);
+        } else {
+          writeBlock(gMotionModal.format(0), gFormat.format(42), x, y, z);
+        }
         break;
       default:
-        writeBlock(gMotionModal.format(0), gFormat.format(40), x, y, z);
+        if (usePolarMode) {
+          writeBlock(gMotionModal.format(0), gFormat.format(40), x, z, y);
+        } else {
+          writeBlock(gMotionModal.format(0), gFormat.format(40), x, y, z);
+        }
       }
     } else {
-      writeBlock(gMotionModal.format(0), x, y, z);
+      if (usePolarMode) {
+        writeBlock(gMotionModal.format(0), x, z, y);
+      } else {
+        writeBlock(gMotionModal.format(0), x, y, z);
+      }
     }
     forceFeed();
   }
@@ -1585,6 +1782,46 @@ function onLinear(_x, _y, _z, feed) {
     return;
   }
   if (suppressThreadCyclePointMotion) {
+    return;
+  }
+  if (useXZCMode) {
+    if (pendingRadiusCompensation >= 0) {
+      error(localize("Radius compensation mode is not supported for XZC mode."));
+      return;
+    }
+
+    var start = getCurrentPosition();
+    var startRadius = getModulus(start.x, start.y);
+    var endRadius = getModulus(_x, _y);
+    var radius = Math.min(startRadius, endRadius);
+
+    if ((radius < 0.1) &&
+        hasParameter("operation-strategy") &&
+        (getParameter("operation-strategy") != "drill")) {
+      error(localize("Cannot machine radius 0."));
+      return;
+    }
+
+    var c = getCClosest(_x, _y, cOutput.getCurrent());
+    var sweep = Math.abs(c - cOutput.getCurrent());
+    if (sweep >= (Math.PI - 1e-6)) {
+      error(localize("Cannot machine 180deg sweep."));
+      return;
+    }
+
+    // Linearize XY moves into short X/C/Z segments for stable C-axis motion.
+    var numberOfSegments = getNumberOfSegments(radius, sweep, getTolerance());
+    var factor = 1.0 / numberOfSegments;
+    for (var i = 1; i <= numberOfSegments; ++i) {
+      var u = i * factor;
+      var ux = u * _x + (1 - u) * start.x;
+      var uy = u * _y + (1 - u) * start.y;
+      var uz = u * _z + (1 - u) * start.z;
+      var x = xOutput.format(getModulus(ux, uy));
+      var c = cOutput.format(getCClosest(ux, uy, cOutput.getCurrent()));
+      var z = zOutput.format(uz);
+      writeBlock(gMotionModal.format(1), x, c, z, getFeed(feed));
+    }
     return;
   }
   if (isSpeedFeedSynchronizationActive()) {
@@ -1601,6 +1838,10 @@ function onLinear(_x, _y, _z, feed) {
   var x = xOutput.format(_x);
   var y = yOutput.format(_y);
   var z = zOutput.format(_z);
+  if (usePolarMode && !x && y) {
+    xOutput.reset();
+    x = xOutput.format(_x);
+  }
   var f = getFeed(feed);
   if (x || y || z) {
     if (pendingRadiusCompensation >= 0) {
@@ -1608,16 +1849,32 @@ function onLinear(_x, _y, _z, feed) {
       writeBlock(gPlaneModal.format(18));
       switch (radiusCompensation) {
       case RADIUS_COMPENSATION_LEFT:
-        writeBlock(gMotionModal.format(1), gFormat.format(41), x, y, z, f);
+        if (usePolarMode) {
+          writeBlock(gMotionModal.format(1), gFormat.format(41), x, z, y, f);
+        } else {
+          writeBlock(gMotionModal.format(1), gFormat.format(41), x, y, z, f);
+        }
         break;
       case RADIUS_COMPENSATION_RIGHT:
-        writeBlock(gMotionModal.format(1), gFormat.format(42), x, y, z, f);
+        if (usePolarMode) {
+          writeBlock(gMotionModal.format(1), gFormat.format(42), x, z, y, f);
+        } else {
+          writeBlock(gMotionModal.format(1), gFormat.format(42), x, y, z, f);
+        }
         break;
       default:
-        writeBlock(gMotionModal.format(1), gFormat.format(40), x, y, z, f);
+        if (usePolarMode) {
+          writeBlock(gMotionModal.format(1), gFormat.format(40), x, z, y, f);
+        } else {
+          writeBlock(gMotionModal.format(1), gFormat.format(40), x, y, z, f);
+        }
       }
     } else {
-      writeBlock(gMotionModal.format(1), x, y, z, f);
+      if (usePolarMode) {
+        writeBlock(gMotionModal.format(1), x, z, y, f);
+      } else {
+        writeBlock(gMotionModal.format(1), x, y, z, f);
+      }
     }
   } else if (f) {
     if (getNextRecord().isMotion()) { // try not to output feed without motion
@@ -1629,6 +1886,16 @@ function onLinear(_x, _y, _z, feed) {
 }
 
 function onCircular(clockwise, cx, cy, cz, x, y, z, feed) {
+  if (useXZCMode) {
+    // Arc output in XZC is converted to line segments.
+    linearize(getTolerance());
+    return;
+  }
+  if (usePolarMode) {
+    // Polar mode arcs are also linearized to avoid unsupported combinations.
+    linearize(getTolerance());
+    return;
+  }
   if (isSpeedFeedSynchronizationActive()) {
     error(localize("Speed-feed synchronization is not supported for circular moves."));
     return;
@@ -2245,6 +2512,11 @@ function onSpindleSpeed(spindleSpeed) {
 }
 
 function startSpindle(tappingMode, forceRPMMode, initialPosition) {
+  if ((currentSection.getType() == TYPE_MILLING) && !tappingMode) {
+    writeBlock(mFormat.format(60));
+    return;
+  }
+
   var spindleDir;
   var _spindleSpeed;
   var spindleMode;
@@ -2413,6 +2685,17 @@ function onSectionEnd() {
     engagePartCatcher(false);
   }
 
+  if (currentSection.getType() == TYPE_MILLING) {
+    writeBlock(mFormat.format(61));
+  }
+
+  if (usePolarMode) {
+    setPolarMode(false);
+    usePolarMode = false;
+  }
+
+  useXZCMode = false;
+
   forceAny();
 }
 
@@ -2461,7 +2744,7 @@ function writeRetract() {
   for (var i = 0; i < retractAxes.length; ++i) {
     switch (retractAxes[i]) {
     case X:
-      words.push((method == "G74" ? "X" : "X" + xFormat.format(_xHome)));
+      words.push((method == "G74" ? "X" : "X" + xHomeFormat.format(_xHome)));
       retracted[X] = true;
       xOutput.reset();
       break;
@@ -2477,7 +2760,7 @@ function writeRetract() {
       zOutput.reset();
       break;
     case XZ:
-      words.push((method == "G74" ? "X" : "X" + xFormat.format(_xHome)));
+      words.push((method == "G74" ? "X" : "X" + xHomeFormat.format(_xHome)));
       words.push((method == "G74" ? "Z" : "Z" + zFormat.format(_zHome)));
       retracted[X] = true;
       retracted[Z] = true;
