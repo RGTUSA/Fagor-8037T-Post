@@ -154,7 +154,7 @@ var gRetractModal = createModal({}, gFormat);     // modal group 10 // G98-99
 // FIXED SETTINGS ---------------------------------------------------------------------------------------------------------------
 var firstFeedParameter = 500;
 
-var gotYAxis = false; // Y-axis not supported into this post, don´t turn it on!
+var gotYAxis = false; // Y-axis not supported into this post, donï¿½t turn it on!
 var yAxisMinimum = toPreciseUnit(gotYAxis ? -50.8 : 0, MM); // specifies the minimum range for the Y-axis
 var yAxisMaximum = toPreciseUnit(gotYAxis ? 50.8 : 0, MM); // specifies the maximum range for the Y-axis
 var xAxisMinimum = toPreciseUnit(0, MM); // specifies the maximum range for the X-axis (RADIUS MODE VALUE)
