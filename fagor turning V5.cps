@@ -439,6 +439,8 @@ var isSubSpindleBarPull = false;
 var subSpindleOperationActive = false;
 var shouldStopSpindleForBarPull = false;
 var barPullSequenceActive = false;
+var lastBarPullChuckPosition = undefined;
+var forceToolCallAfterBarPull = false;
 var retracted = new Array(false, false, false); // specifies that the tool has been retracted to the safe plane
 var fpmCode = 94;
 var fprCode = 95;
@@ -1077,6 +1079,25 @@ function getTolerance() {
   return t;
 }
 
+function isAxialCenterlineDrillingSection(section) {
+  if (!section || section.getType() != TYPE_MILLING) {
+    return false;
+  }
+
+  var strategy = "";
+  try {
+    strategy = section.hasParameter("operation:strategy") ? section.getParameter("operation:strategy") : "";
+  } catch (e) {
+    strategy = "";
+  }
+  if (strategy != "drill") {
+    return false;
+  }
+
+  var initialPosition = getFramePosition(section.getInitialPosition());
+  return !xFormat.isSignificant(initialPosition.x) && !yFormat.isSignificant(initialPosition.y);
+}
+
 function handleSubSpindleOperation() {
   // Output M-codes and pauses for spindle grab and bar-pull
   if (isSubSpindleGrab || isSubSpindleBarPull) {
@@ -1225,6 +1246,9 @@ function handleBarPullCycle(cycleTypeValue) {
       var feedValue = getFeed(cycle.feedrate);
       writeBlock(gMotionModal.format(1), "Z" + zFormat.format(cycle.chuckPosition), feedValue);
     }
+    if (cycle.chuckPosition != undefined) {
+      lastBarPullChuckPosition = cycle.chuckPosition;
+    }
     break;
     
   case "secondary-spindle-return":
@@ -1270,6 +1294,8 @@ function handleBarPullCycle(cycleTypeValue) {
     
     // Retract Z
     writeRetract(Z);
+    barPullSequenceActive = false;
+    forceToolCallAfterBarPull = true;
     break;
     
   case "secondary-spindle-pull":
@@ -1305,17 +1331,18 @@ function handleBarPullCycle(cycleTypeValue) {
       writeBlock(gFormat.format(4), "K" + kFormat.format(dwellTime));
     }
     
-    // Bar pull motion - determine pull position from cycle properties
+    // Bar pull motion - determine pull position from cycle properties.
+    // Prefer pull distance + chuck reference so Fusion's pull distance drives the move.
     var pullPosition = 0;
-    if (cycle.pullPosition != undefined) {
-      // pullPosition is the final Z position after pulling
+    var chuckReference = (cycle.chuckPosition != undefined) ? cycle.chuckPosition : lastBarPullChuckPosition;
+    if (cycle.pullingDistance != undefined && chuckReference != undefined) {
+      pullPosition = chuckReference + cycle.pullingDistance;
+    } else if (cycle.pullPosition != undefined) {
+      // pullPosition is the final Z position after pulling.
       pullPosition = cycle.pullPosition;
     } else if (cycle.pullPositionWorkCS != undefined && Array.isArray(cycle.pullPositionWorkCS)) {
-      // pullPositionWorkCS is [X, Y, Z] - use Z value
+      // pullPositionWorkCS is [X, Y, Z] - use Z value.
       pullPosition = cycle.pullPositionWorkCS[2];
-    } else if (cycle.pullingDistance != undefined && cycle.chuckPosition != undefined) {
-      // Calculate from chuck position + pulling distance
-      pullPosition = cycle.chuckPosition + cycle.pullingDistance;
     }
     
     // Output bar pull motion
@@ -1337,6 +1364,8 @@ function handleBarPullCycle(cycleTypeValue) {
     
     // Retract Z
     writeRetract(Z);
+    barPullSequenceActive = false;
+    forceToolCallAfterBarPull = true;
     break;
   }
 }
@@ -1423,6 +1452,7 @@ function onSection() {
   optionalSection = currentSection.isOptional();
 
   var turning = (currentSection.getType() == TYPE_TURNING);
+  var axialCenterlineDrilling = isAxialCenterlineDrillingSection(currentSection);
   useXZCMode = false;
   var desiredPolarMode = false;
   if (currentSection.getType() == TYPE_MILLING) {
@@ -1434,30 +1464,40 @@ function onSection() {
       error(localize("C-axis is not supported by the CNC machine."));
       return;
     }
-    var liveToolingMode = getLiveToolingMode(currentSection);
-    if (liveToolingMode == 1) {
-      error(localize("Milling from Z- is not supported by the CNC machine."));
-      return;
-    }
-    if (liveToolingMode == 0) {
-      // Axial milling: use G15/G16 XC polar interpolation.
-      desiredPolarMode = true;
+    if (axialCenterlineDrilling) {
+      // Treat centerline drilling as non-live interpolation: no G15/G16 XC.
+      desiredPolarMode = false;
       useXZCMode = false;
     } else {
-      // Radial milling: convert XY motion to X(radius)+C(angle).
-      desiredPolarMode = false;
-      useXZCMode = (liveToolingMode == 2);
+      var liveToolingMode = getLiveToolingMode(currentSection);
+      if (liveToolingMode == 1) {
+        error(localize("Milling from Z- is not supported by the CNC machine."));
+        return;
+      }
+      if (liveToolingMode == 0) {
+        // Axial milling: use G15/G16 XC polar interpolation.
+        desiredPolarMode = true;
+        useXZCMode = false;
+      } else {
+        // Radial milling: convert XY motion to X(radius)+C(angle).
+        desiredPolarMode = false;
+        useXZCMode = (liveToolingMode == 2);
+      }
     }
   }
 
   usePolarMode = desiredPolarMode;
 
-  var insertToolCall = forceSectionRestart || isFirstSection() ||
+  var forceToolCallThisSection = forceToolCallAfterBarPull;
+  var insertToolCall = forceSectionRestart || isFirstSection() || forceToolCallThisSection ||
     currentSection.getForceToolChange && currentSection.getForceToolChange() ||
     (tool.number != getPreviousSection().getTool().number) ||
     (tool.compensationOffset != getPreviousSection().getTool().compensationOffset) ||
     (tool.diameterOffset != getPreviousSection().getTool().diameterOffset) ||
     (tool.lengthOffset != getPreviousSection().getTool().lengthOffset);
+  if (forceToolCallThisSection) {
+    forceToolCallAfterBarPull = false;
+  }
 
   var newSpindle = isFirstSection() ||
     (getPreviousSection().spindle != currentSection.spindle);
@@ -2512,7 +2552,7 @@ function onSpindleSpeed(spindleSpeed) {
 }
 
 function startSpindle(tappingMode, forceRPMMode, initialPosition) {
-  if ((currentSection.getType() == TYPE_MILLING) && !tappingMode) {
+  if ((currentSection.getType() == TYPE_MILLING) && !tappingMode && !isAxialCenterlineDrillingSection(currentSection)) {
     writeBlock(mFormat.format(60));
     return;
   }
@@ -2685,7 +2725,7 @@ function onSectionEnd() {
     engagePartCatcher(false);
   }
 
-  if (currentSection.getType() == TYPE_MILLING) {
+  if ((currentSection.getType() == TYPE_MILLING) && !isAxialCenterlineDrillingSection(currentSection)) {
     writeBlock(mFormat.format(61));
   }
 
